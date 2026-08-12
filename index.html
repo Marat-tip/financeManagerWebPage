@@ -1,0 +1,864 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Запись траты</title>
+<!--
+  Форма записи траты для Telegram Mini App (fm-kmd.29, раскладка — ADR-0004 приватного
+  репозитория журнала). Одна страница без сборки и зависимостей; деплой разовый —
+  страница не пересобирается при изменении данных.
+
+  Данных на странице нет. Каталог (счета и места) приезжает фрагментом URL от бота:
+
+      #c=<base64url(gzip(json))>&tgWebAppData=...
+
+  Фрагмент серверу не отправляется, поэтому ни в логах Pages, ни в кеше CDN каталог
+  не появляется. Набивка `=` у base64url срезана отправителем — перед декодированием
+  она добивается обратно до кратности 4. Кусок `c=` идёт первым, но ищется по всему
+  фрагменту: клиент Telegram дописывает свои `tgWebApp*` через `&`.
+
+  Каталог (версия 1):
+      {"v":1, "a":[["Assets:Cash","A"],...], "p":[["Starbucks",5],["Без дефолта"]]}
+  `a` — счета в порядке объявления, `[имя, тип]`. `p` — места по убыванию частоты,
+  `[payee, индекс счёта-получателя прошлой записи в a]`; один элемент = дефолта нет.
+
+  Ответ боту — Telegram.WebApp.sendData, поля JSON = поля транзакции (схема 1):
+      {"v":1,"date":"2026-08-12","payee":"Starbucks","from":"Assets:Bank:Card",
+       "to":"Expenses:Food:Cafe","amount":"1200.00","cur":"KZT","note":"..."}
+
+  Открытая с `#test` страница вместо формы гоняет встроенные самотесты — на
+  синтетическом каталоге, закодированном тем же кодом, что у бота (gzip mtime=0).
+-->
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root{
+    --bg: var(--tg-theme-secondary-bg-color, #f2f3f5);
+    --card: var(--tg-theme-section-bg-color, #ffffff);
+    --text: var(--tg-theme-text-color, #000000);
+    --hint: var(--tg-theme-hint-color, #707579);
+    --link: var(--tg-theme-link-color, #3390ec);
+    --btn: var(--tg-theme-button-color, #3390ec);
+    --btn-text: var(--tg-theme-button-text-color, #ffffff);
+    --sep: rgba(128,128,128,.18);
+    --danger:#e53935; --warn:#f0a30a; --ok:#2ea34a;
+  }
+  /* Вне Telegram переменных --tg-theme-* нет — тёмная тема берётся из системы.
+     Внутри Telegram var() сперва смотрит в переменную клиента, поэтому override
+     обязан сохранять ту же цепочку, а не перебивать её голым цветом. */
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg: var(--tg-theme-secondary-bg-color, #17212b);
+      --card: var(--tg-theme-section-bg-color, #232e3c);
+      --text: var(--tg-theme-text-color, #ffffff);
+      --hint: var(--tg-theme-hint-color, #8d969c);
+      --link: var(--tg-theme-link-color, #6ab3f3);
+      --btn: var(--tg-theme-button-color, #5288c1);
+    }
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0;background:var(--bg);color:var(--text);
+    font:16px/1.4 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,sans-serif;
+  }
+  #app{max-width:560px;margin:0 auto;padding:8px 0 28px}
+
+  .group{background:var(--card);margin:10px 12px;border-radius:12px;overflow:hidden}
+  .caption{font-size:13px;color:var(--hint);margin:14px 24px 6px}
+  .row{
+    display:flex;align-items:center;gap:10px;padding:11px 14px;min-height:48px;
+    border-bottom:1px solid var(--sep);cursor:pointer;background:none;width:100%;
+    border-top:0;border-left:0;border-right:0;font:inherit;color:inherit;text-align:left;
+  }
+  .row:last-child{border-bottom:0}
+  .row:active{background:rgba(128,128,128,.12)}
+  .row .lab{flex:0 0 96px;color:var(--hint);font-size:14px}
+  .row .val{flex:1 1 auto;font-size:16px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .row .val.ph{color:var(--hint);opacity:.7}
+  .row .val small{display:block;font-size:11px;color:var(--hint);margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .row .chev{color:var(--hint);opacity:.6;font-size:16px;flex:0 0 auto}
+  .guess{border-bottom:1px dashed var(--warn)}
+  .badge{
+    font-size:10px;background:rgba(240,163,10,.16);color:#a8730b;border-radius:5px;
+    padding:1px 5px;margin-left:6px;vertical-align:1px;white-space:nowrap;
+  }
+  @media (prefers-color-scheme: dark){.badge{color:#e8b23c}}
+
+  .amtwrap{padding:18px 14px 12px;text-align:center}
+  input.amt{
+    font:600 36px/1.1 inherit;border:0;background:transparent;color:inherit;width:100%;
+    outline:none;text-align:center;letter-spacing:-.02em;
+  }
+  input.amt::placeholder{color:var(--hint);opacity:.5}
+  .curbtn{
+    font:inherit;font-size:14px;color:var(--link);background:none;border:0;cursor:pointer;
+    padding:2px 8px;margin-top:2px;
+  }
+  input.txt{font:inherit;border:0;background:transparent;color:inherit;width:100%;outline:none;padding:0}
+  input.date{
+    font:inherit;border:0;background:transparent;color:inherit;outline:none;padding:0;
+    -webkit-appearance:none;appearance:none;
+  }
+
+  .cta{
+    margin:16px 12px 8px;display:block;width:calc(100% - 24px);padding:14px;border:0;
+    border-radius:10px;background:var(--btn);color:var(--btn-text);font:600 16px inherit;cursor:pointer;
+  }
+  .cta[disabled]{opacity:.4;cursor:not-allowed}
+  .note{font-size:12px;color:var(--hint);margin:6px 24px 0;line-height:1.45}
+
+  .types{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:12px}
+  .type{
+    background:var(--card);border:2px solid transparent;border-radius:14px;padding:16px 12px;
+    display:flex;flex-direction:column;gap:5px;align-items:flex-start;cursor:pointer;
+    font:inherit;color:inherit;
+  }
+  .type:active{border-color:var(--btn)}
+  .type .ic{font-size:22px}
+  .type .t{font-weight:600;font-size:15px}
+  .type .d{font-size:12px;color:var(--hint);line-height:1.35;text-align:left}
+  .typebar{
+    display:flex;align-items:center;gap:8px;margin:10px 12px 0;padding:10px 14px;
+    background:var(--card);border-radius:10px;font-size:14px;
+  }
+  .typebar b{font-weight:600}
+  .typebar button{margin-left:auto;font:inherit;color:var(--link);background:none;border:0;cursor:pointer;font-size:14px}
+
+  .scrim{position:fixed;inset:0;background:rgba(0,0,0,.35);display:none;z-index:5}
+  .scrim.on{display:block}
+  .sheet{
+    position:fixed;left:0;right:0;bottom:0;max-height:85vh;max-height:85dvh;
+    background:var(--card);border-radius:14px 14px 0 0;display:none;flex-direction:column;z-index:6;
+    max-width:560px;margin:0 auto;
+  }
+  .sheet.on{display:flex}
+  .sheet header{
+    padding:12px 14px;border-bottom:1px solid var(--sep);display:flex;align-items:center;gap:10px;flex:0 0 auto;
+  }
+  .sheet header .h{font-weight:600;font-size:15px}
+  .sheet header button{margin-left:auto;background:none;border:0;color:var(--link);font:inherit;cursor:pointer}
+  .sheet .search{padding:8px 14px;border-bottom:1px solid var(--sep);flex:0 0 auto}
+  .sheet .search input{
+    width:100%;font:inherit;padding:9px 11px;border-radius:9px;border:1px solid var(--sep);
+    background:var(--bg);color:inherit;outline:none;
+  }
+  .sheet .list{overflow-y:auto;flex:1 1 auto;-webkit-overflow-scrolling:touch}
+  .opt{
+    display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--sep);
+    cursor:pointer;width:100%;background:none;border-top:0;border-left:0;border-right:0;
+    font:inherit;color:inherit;text-align:left;
+  }
+  .opt:active{background:rgba(128,128,128,.12)}
+  .opt .n{flex:1 1 auto;font-size:15px}
+  .opt .n small{display:block;color:var(--hint);font-size:11px;margin-top:1px}
+  .grp{padding:8px 14px 4px;font-size:11px;color:var(--hint);background:var(--bg);position:sticky;top:0}
+  .deadend{padding:12px 14px;font-size:12px;color:var(--hint);line-height:1.5;background:var(--bg)}
+  .deadend b{color:var(--danger)}
+  .guard{
+    margin:10px 14px;padding:11px 12px;border-radius:10px;background:rgba(240,163,10,.14);
+    font-size:14px;line-height:1.45;
+  }
+  .guard .btns{display:flex;gap:8px;margin-top:9px;flex-wrap:wrap}
+  .guard button{
+    font:inherit;font-size:14px;padding:7px 11px;border-radius:8px;border:1px solid var(--sep);
+    background:var(--card);color:inherit;cursor:pointer;
+  }
+  .guard button.pri{background:var(--btn);color:var(--btn-text);border-color:transparent}
+
+  .err{padding:32px 24px;text-align:center}
+  .err .ic{font-size:40px}
+  .err h2{font-size:18px;margin:10px 0 6px}
+  .err p{font-size:14px;color:var(--hint);line-height:1.5;margin:0}
+  .err pre{
+    text-align:left;background:var(--card);padding:12px;border-radius:10px;margin-top:14px;
+    font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word;
+  }
+
+  .debug{padding:16px 12px}
+  .debug h2{font-size:16px;margin:4px 8px 10px}
+  .debug .hint{font-size:12px;color:var(--hint);margin:0 8px 10px;line-height:1.5}
+  .debug pre{
+    background:var(--card);padding:12px;border-radius:10px;overflow-x:auto;
+    font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;margin:0 0 10px;
+  }
+
+  .tests{padding:16px 12px;font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace}
+  .tests h2{font:600 16px/1.3 inherit;margin:4px 4px 12px}
+  .tests .case{padding:6px 10px;border-radius:8px;margin-bottom:4px;background:var(--card);word-break:break-word}
+  .tests .case.fail{background:rgba(229,57,53,.14)}
+  .tests .sum{margin:12px 4px;font-weight:600}
+  .tests .sum.bad{color:var(--danger)}
+  .tests .sum.good{color:var(--ok)}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div class="scrim" id="scrim"></div>
+<div class="sheet" id="sheet">
+  <header><span class="h" id="sheetTitle"></span><button id="sheetCancel" type="button">Отмена</button></header>
+  <div class="search" id="sheetSearchWrap"><input id="sheetSearch" placeholder="Поиск" autocomplete="off"></div>
+  <div class="list" id="sheetList"></div>
+</div>
+<script>
+'use strict';
+
+/* ═══════════════ контракт ═══════════════ */
+
+const CATALOG_VERSION = 1;   // «c=» во фрагменте
+const SCHEMA_VERSION = 1;    // sendData боту
+
+// Хвост выписки (ADR-0008 журнала): счёт объявлен и приезжает в каталоге, но владелец
+// его не выбирает — на этом держится инвариант «Expenses:Unknown не свалка».
+const EXCLUDED = new Set(['Expenses:Unknown']);
+
+// Что запрещено в свободном тексте зеркально боту: `;` открывает комментарий hledger,
+// `|` режет payee от заметки, управляющие символы ломают строку журнала.
+const FORBIDDEN = /[;|\u0000-\u001f\u007f]/g;
+const AMOUNT_RE = /^\d+(\.\d{1,2})?$/;
+
+/* Тип операции — фильтр деревьев «откуда → куда» и подписи полей (ADR-0004).
+   В журнал тип не попадает: он израсходован на фильтрацию. Дерево счёта читается из
+   имени, а не из типа hledger — корень `Transfers` hledger не знает.
+   `toTypical`: подставлять ли «куда» типичным счётом при выборе типа. У траты — нет:
+   там «куда» приходит по месту, глобально частая категория была бы догадкой. */
+const TYPES = {
+  spend:  {t:'Трата',        ic:'\u{1F6D2}', d:'деньги ушли наружу',
+           from:['Assets','Liabilities'], to:['Expenses','Transfers:Out'],
+           lf:'Счёт', lt:'Категория', toTypical:false},
+  income: {t:'Доход',        ic:'\u{1F4B0}', d:'деньги пришли',
+           from:['Income','Transfers:In'], to:['Assets'],
+           lf:'Источник', lt:'Куда', toTypical:true},
+  move:   {t:'Перевод себе', ic:'\u{1F501}', d:'между своими счетами',
+           from:['Assets'], to:['Assets'],
+           lf:'Откуда', lt:'Куда', toTypical:true},
+  repay:  {t:'Погашение',    ic:'\u{1F3E6}', d:'платёж по долгу',
+           from:['Assets'], to:['Liabilities'],
+           lf:'С какого', lt:'По какому', toTypical:true},
+};
+
+const CURRENCIES = ['KZT', 'USD', 'EUR', 'TRY', 'RUB'];
+
+/* ═══════════════ каталог ═══════════════ */
+
+let CAT = null;
+
+function setCatalog(cat){ CAT = cat; }
+
+function fragPart(hash){
+  for (const piece of hash.split('&')) if (piece.startsWith('c=')) return piece.slice(2);
+  return null;
+}
+
+async function decodeCatalog(part){
+  // Набивку `=` бот срезал (fm-kmd.27) — добивается до кратности 4 перед atob.
+  let s = part.replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4) s += '=';
+  const bytes = Uint8Array.from(atob(s), c => c.charCodeAt(0));
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return JSON.parse(await new Response(stream).text());
+}
+
+function checkCatalog(cat){
+  if (!cat || typeof cat !== 'object') throw new Error('каталог не объект');
+  if (cat.v !== CATALOG_VERSION)
+    throw new Error(`каталог версии ${cat.v}, страница понимает ${CATALOG_VERSION} — ` +
+                    `страница в кеше вебвью разъехалась с ботом; закрой форму и открой заново`);
+  if (!Array.isArray(cat.a) || !Array.isArray(cat.p)) throw new Error('в каталоге нет a/p');
+  return cat;
+}
+
+const tree = name => (name || '').split(':')[0];
+const short = name => name ? name.split(':').slice(1).join(' › ') || name : '';
+
+// Счёт попадает под фильтр, если совпал с веткой целиком или лежит под ней.
+// Фильтры бывают и деревом (`Assets`), и поддеревом (`Transfers:Out`) — ADR-0004.
+const fits = (name, filters) =>
+  filters.some(f => name === f || name.startsWith(f + ':'));
+
+function allowed(filters){
+  return CAT.a.map(pair => pair[0])
+              .filter(name => fits(name, filters) && !EXCLUDED.has(name));
+}
+
+/* Типичный счёт дерева — тот, что чаще всего стоит дефолтом у мест каталога.
+   Частоты счетов в каталоге нет; дефолты мест — единственный след того, через какой
+   счёт ходят деньги. Ничего не нашлось — пусто: дефолты деградируют в пустоту,
+   а не в догадку (ADR-0004). */
+function typical(filters){
+  const count = new Map();
+  for (const place of CAT.p){
+    if (place.length < 2) continue;
+    const target = (CAT.a[place[1]] || [])[0];
+    if (target && fits(target, filters) && !EXCLUDED.has(target))
+      count.set(target, (count.get(target) || 0) + 1);
+  }
+  let best = null;                    // при равенстве — более ранний в объявлении
+  for (const [name] of CAT.a)
+    if (count.has(name) && (best === null || count.get(name) > count.get(best)))
+      best = name;
+  return best;
+}
+
+function placeTarget(payee){
+  const place = CAT.p.find(p => p[0] === payee);
+  if (!place || place.length < 2) return null;
+  return (CAT.a[place[1]] || [])[0] || null;
+}
+
+/* ═══════════════ fuzzy-guard на новое место ═══════════════ */
+
+/* Guard молчит, пока набранное подходит хоть одному месту («Star» — недонабранный
+   Starbucks, а не новое место), и поднимается только на непохожем вводе. Без правила
+   молчания плашка мигала бы на каждой букве, и её перестали бы читать (ADR-0004). */
+
+const TRANSLIT = {'а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'e','ж':'zh','з':'z',
+  'и':'i','й':'i','к':'k','л':'l','м':'m','н':'n','о':'o','п':'p','р':'r','с':'s','т':'t',
+  'у':'u','ф':'f','х':'h','ц':'c','ч':'ch','ш':'sh','щ':'sch','ы':'y','ь':'','ъ':'',
+  'э':'e','ю':'u','я':'ya'};
+const norm = s => s.toLowerCase().split('').map(c => TRANSLIT[c] ?? c).join('')
+                   .replace(/[^a-z0-9]/g, '');
+
+function lev(a, b){
+  const m = [...Array(a.length + 1)].map((_, i) => [i, ...Array(b.length).fill(0)]);
+  for (let j = 0; j <= b.length; j++) m[0][j] = j;
+  for (let i = 1; i <= a.length; i++)
+    for (let j = 1; j <= b.length; j++)
+      m[i][j] = Math.min(m[i-1][j] + 1, m[i][j-1] + 1,
+                         m[i-1][j-1] + (a[i-1] === b[j-1] ? 0 : 1));
+  return m[a.length][b.length];
+}
+
+const hitsAny = raw => {
+  const f = raw.trim().toLowerCase();
+  return !!f && CAT.p.some(p => p[0].toLowerCase().includes(f));
+};
+
+function nearestPlace(raw){
+  const q = norm(raw);
+  if (q.length < 3) return null;
+  let best = null, bd = Infinity;
+  for (const p of CAT.p){
+    const t = norm(p[0]);
+    if (t === q) return p[0];         // транслит-двойник существующего — не новое место
+    const d = lev(q, t);
+    if (1 - d / Math.max(q.length, t.length) > .55 && d < bd){ bd = d; best = p[0]; }
+  }
+  return best;
+}
+
+/* ═══════════════ состояние формы ═══════════════ */
+
+const today = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+};
+
+let S = null;
+
+function fresh(){
+  return {type:null, amount:'', cur:'KZT', place:'', from:null, to:null,
+          fromWhy:'', toWhy:'', date:today(), note:''};
+}
+
+/* Смена типа сохраняет выбранное руками, пока оно попадает под новый фильтр;
+   подставленное пересчитывается. Подставленное подписано, откуда взялось —
+   неверный дефолт обязан быть заметен (ADR-0004). */
+function retype(s, key){
+  s.type = key;
+  const t = TYPES[key];
+  if (!(s.from && !s.fromWhy && fits(s.from, t.from))){
+    s.from = typical(t.from);
+    s.fromWhy = s.from ? 'типичное' : '';
+  }
+  if (!(s.to && !s.toWhy && fits(s.to, t.to))){
+    let want = t.toTypical ? typical(t.to) : null;
+    if (want && want === s.from) want = null;   // перевод сам в себя — не дефолт
+    s.to = want;
+    s.toWhy = want ? 'типичное' : '';
+  }
+  return s;
+}
+
+/* Выбор места подставляет «куда» счётом-получателем его прошлой записи, если тот
+   попадает под фильтр типа. Явно выбранное рукой не перебивается. */
+function applyPlace(s, payee){
+  s.place = payee;
+  const target = placeTarget(payee);
+  const t = TYPES[s.type];
+  if (target && fits(target, t.to) && !EXCLUDED.has(target) && target !== s.from
+      && (!s.to || s.toWhy)){
+    s.to = target;
+    s.toWhy = 'по месту';
+  }
+  return s;
+}
+
+const clean = text => String(text ?? '').replace(FORBIDDEN, ' ');
+
+function ready(s){
+  return AMOUNT_RE.test(s.amount) && +s.amount > 0
+    && !!clean(s.place).trim() && !!s.from && !!s.to && s.from !== s.to
+    && /^\d{4}-\d{2}-\d{2}$/.test(s.date);
+}
+
+function buildPayload(s){
+  const p = {v:SCHEMA_VERSION, date:s.date, payee:clean(s.place).trim(),
+             from:s.from, to:s.to, amount:(+s.amount).toFixed(2), cur:s.cur};
+  const note = clean(s.note).trim();
+  if (note) p.note = note;            // необязательное поле не едет пустым
+  return p;
+}
+
+// Предпросмотр строки журнала для отладочного экрана — по образцу journal.render():
+// явным стоит постинг-получатель, балансирующий идёт голым.
+function journalPreview(p){
+  const head = p.date + ' ' + p.payee + (p.note ? ' | ' + p.note : '');
+  return head + '  ; src:app, id:(добавит бот)\n'
+    + '    ' + p.to.padEnd(30) + p.amount.padStart(14) + ' ' + p.cur + '\n'
+    + '    ' + p.from;
+}
+
+/* ═══════════════ отправка ═══════════════ */
+
+const TG = window.Telegram && window.Telegram.WebApp;
+
+// Настоящий клиент дописывает во фрагмент свои tgWebApp* (замер fm-kmd.15); их
+// отсутствие значит, что страница открыта браузером — sendData уйдёт в никуда,
+// и честнее показать, что ушло бы боту.
+const RAW_HASH = location.hash.slice(1);
+const IN_TELEGRAM = RAW_HASH.includes('tgWebAppData=');
+
+function send(){
+  const payload = buildPayload(S);
+  const body = JSON.stringify(payload);
+  if (IN_TELEGRAM && TG){
+    TG.sendData(body);                // Telegram сам закрывает Mini App
+    return;
+  }
+  paint(viewDebug(payload, body));
+}
+
+/* ═══════════════ рендер ═══════════════ */
+
+const esc = s => String(s ?? '').replace(/[&<>"]/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+const app = document.getElementById('app');
+function paint(html){ app.innerHTML = html; wire(); }
+
+function rowPick(lab, val, ph, act, opts = {}){
+  const badge = opts.badge ? `<span class="badge">${esc(opts.badge)}</span>` : '';
+  return `<button type="button" class="row" data-act="${act}">
+    <span class="lab">${esc(lab)}</span>
+    <span class="val${val ? (opts.badge ? ' guess' : '') : ' ph'}">${val ? esc(val) + badge : esc(ph)}
+      ${val && opts.sub ? `<small>${esc(opts.sub)}</small>` : ''}</span>
+    <span class="chev">›</span></button>`;
+}
+
+function viewType(){
+  return `<div class="caption" style="margin-top:10px">Что произошло?</div>
+    <div class="types">${Object.entries(TYPES).map(([k, t]) => `
+      <button type="button" class="type" data-act="type:${k}">
+        <span class="ic">${t.ic}</span><span class="t">${esc(t.t)}</span><span class="d">${esc(t.d)}</span>
+      </button>`).join('')}
+    </div>
+    <div class="note">Тип — не поле транзакции, а фильтр: он решает, из каких деревьев
+      берутся счета, и подставляет типичный. В журнал уходят два счёта.</div>`;
+}
+
+function viewForm(){
+  const t = TYPES[S.type];
+  return `<div class="typebar"><span>${t.ic}</span><b>${esc(t.t)}</b>
+      <button type="button" data-act="untype">сменить</button></div>
+    <div class="group"><div class="amtwrap">
+      <input class="amt" id="amount" inputmode="decimal" placeholder="0"
+             value="${esc(S.amount)}" autocomplete="off">
+      <button type="button" class="curbtn" data-act="cur">${esc(S.cur)}</button>
+    </div></div>
+    <div class="group">
+      ${rowPick('Место', S.place, 'выбрать', 'place')}
+      ${rowPick(t.lf, short(S.from), 'выбрать', 'from', {sub:S.from, badge:S.fromWhy})}
+      ${rowPick(t.lt, short(S.to), 'выбрать', 'to', {sub:S.to, badge:S.toWhy})}
+    </div>
+    <div class="group">
+      <div class="row" style="cursor:default"><span class="lab">Дата</span>
+        <input class="date" type="date" id="date" value="${esc(S.date)}"></div>
+      <div class="row" style="cursor:default"><span class="lab">Заметка</span>
+        <input class="txt" id="note" placeholder="необязательно" value="${esc(S.note)}"></div>
+    </div>
+    <button type="button" class="cta" data-act="send" ${ready(S) ? '' : 'disabled'}>Отправить</button>
+    <div class="note">Подчёркнутое подставлено формой и подписано, откуда взялось.
+      Не то — тапни и выбери руками.</div>`;
+}
+
+function viewDebug(payload, body){
+  const bytes = new TextEncoder().encode(body).length;
+  return `<div class="debug">
+    <h2>Страница открыта вне Telegram</h2>
+    <p class="hint">sendData некому принять — вот что ушло бы боту (${bytes} байт из 4096)
+      и как это легло бы в журнал:</p>
+    <pre>${esc(JSON.stringify(payload, null, 1))}</pre>
+    <pre>${esc(journalPreview(payload))}</pre>
+    <button type="button" class="cta" data-act="back">Назад к форме</button>
+  </div>`;
+}
+
+function viewError(title, detail){
+  return `<div class="err"><div class="ic">⚠️</div>
+    <h2>${esc(title)}</h2><p>${esc(detail)}</p></div>`;
+}
+
+/* ═══════════════ шторка ═══════════════ */
+
+const sheet = document.getElementById('sheet');
+const scrim = document.getElementById('scrim');
+const sheetList = document.getElementById('sheetList');
+const sheetSearch = document.getElementById('sheetSearch');
+let sheetPaint = null, sheetPick = null;
+
+function openSheet({title, search, paint: paintList, onPick}){
+  document.getElementById('sheetTitle').textContent = title;
+  document.getElementById('sheetSearchWrap').style.display = search ? '' : 'none';
+  sheetSearch.value = '';
+  sheetPaint = paintList;
+  sheetPick = onPick;
+  sheetList.innerHTML = paintList('');
+  scrim.classList.add('on');
+  sheet.classList.add('on');
+}
+function closeSheet(){
+  scrim.classList.remove('on');
+  sheet.classList.remove('on');
+  sheetPaint = sheetPick = null;
+}
+scrim.onclick = closeSheet;
+document.getElementById('sheetCancel').onclick = closeSheet;
+sheetSearch.oninput = e => {
+  if (sheetPaint) sheetList.innerHTML = sheetPaint(clean(e.target.value));
+};
+sheetList.addEventListener('click', e => {
+  const b = e.target.closest('[data-pick]');
+  if (!b || !sheetPick) return;
+  const fn = sheetPick;
+  closeSheet();
+  fn(b.getAttribute('data-pick'));
+  paint(viewForm());
+});
+
+function optHtml(value, name, sub){
+  return `<button type="button" class="opt" data-pick="${esc(value)}">
+    <span class="n">${esc(name)}${sub ? `<small>${esc(sub)}</small>` : ''}</span></button>`;
+}
+
+const DEADEND_CATEGORY = `<div class="deadend">Нужной категории нет?
+  <b>Форма её не заведёт.</b> Категория — счёт из <code>accounts.journal</code>;
+  на незнакомом счёте журнал падает (<code>check accounts --strict</code>).
+  Пункта «Прочее» нет намеренно. Лечение — объявить счёт на ноуте; паллиатив —
+  ближайшая существующая категория, правка потом.</div>`;
+
+function pickAccount(field, title){
+  const t = TYPES[S.type];
+  const filters = field === 'from' ? t.from : t.to;
+  const withDeadend = filters.includes('Expenses');
+  openSheet({
+    title, search: true,
+    paint(filter){
+      const f = filter.trim().toLowerCase();
+      let html = '';
+      for (const branch of filters){
+        const items = allowed([branch]).filter(n => !f || n.toLowerCase().includes(f));
+        if (!items.length) continue;
+        if (filters.length > 1) html += `<div class="grp">${esc(tree(branch))}</div>`;
+        html += items.map(n => optHtml(n, short(n), n)).join('');
+      }
+      if (!html) html = `<div class="deadend">Ничего не нашлось.</div>`;
+      if (withDeadend) html += DEADEND_CATEGORY;
+      return html;
+    },
+    onPick(name){
+      S[field] = name;
+      if (field === 'from'){
+        S.fromWhy = '';
+        if (S.to === name){ S.to = null; S.toWhy = ''; }  // from≠to держит и бот
+      } else S.toWhy = '';
+    },
+  });
+}
+
+function guardHtml(raw){
+  const near = nearestPlace(raw);
+  if (!near) return `<div class="guard">Места «<b>${esc(raw)}</b>» в журнале нет.
+    <div class="btns"><button type="button" class="pri" data-pick="${esc(raw)}">Записать как новое</button></div></div>`;
+  return `<div class="guard">Похоже на <b>${esc(near)}</b> — это оно?
+    <div class="btns">
+      <button type="button" class="pri" data-pick="${esc(near)}">Да, ${esc(near)}</button>
+      <button type="button" data-pick="${esc(raw)}">Нет, новое «${esc(raw)}»</button>
+    </div></div>`;
+}
+
+function pickPlace(){
+  openSheet({
+    title:'Место', search:true,
+    paint(filter){
+      const raw = filter.trim();
+      const f = raw.toLowerCase();
+      let html = '';
+      if (raw && !hitsAny(raw)) html += guardHtml(raw);
+      const items = CAT.p.filter(p => !f || p[0].toLowerCase().includes(f));
+      html += items.map(p => {
+        const target = p.length > 1 ? (CAT.a[p[1]] || [])[0] : null;
+        return optHtml(p[0], p[0], target ? short(target) : '');
+      }).join('');
+      if (!items.length && !raw) html += `<div class="deadend">В журнале ещё нет мест.</div>`;
+      return html;
+    },
+    onPick(payee){ applyPlace(S, payee); },
+  });
+}
+
+function pickCurrency(){
+  openSheet({
+    title:'Валюта', search:false,
+    paint(){
+      let html = CURRENCIES.map(c => optHtml(c, c, '')).join('');
+      html += `<div class="deadend">Другая — тремя буквами:
+        <input id="curFree" maxlength="3" style="font:inherit;width:5em;margin-left:6px;
+          text-transform:uppercase;border:1px solid var(--sep);border-radius:6px;
+          padding:4px 8px;background:var(--bg);color:inherit;outline:none"></div>`;
+      return html;
+    },
+    onPick(cur){ S.cur = cur; },
+  });
+  const free = document.getElementById('curFree');
+  if (free) free.oninput = e => {
+    const v = e.target.value.toUpperCase().replace(/[^A-Z]/g, '');
+    e.target.value = v;
+    if (v.length === 3){ S.cur = v; closeSheet(); paint(viewForm()); }
+  };
+}
+
+/* ═══════════════ события формы ═══════════════ */
+
+function wire(){
+  const amount = document.getElementById('amount');
+  if (amount) amount.oninput = e => {
+    // Только цифры, одна точка, не больше двух знаков после — как примет бот.
+    let v = e.target.value.replace(/[^\d.]/g, '');
+    const dot = v.indexOf('.');
+    if (dot !== -1) v = v.slice(0, dot + 1) + v.slice(dot + 1).replace(/\./g, '').slice(0, 2);
+    e.target.value = v;
+    S.amount = v;
+    const cta = app.querySelector('[data-act="send"]');
+    if (cta) cta.disabled = !ready(S);
+  };
+  const note = document.getElementById('note');
+  if (note) note.oninput = e => { S.note = clean(e.target.value); };
+  const date = document.getElementById('date');
+  if (date) date.onchange = e => {
+    S.date = e.target.value || today();
+    const cta = app.querySelector('[data-act="send"]');
+    if (cta) cta.disabled = !ready(S);
+  };
+}
+
+app.addEventListener('click', e => {
+  const b = e.target.closest('[data-act]');
+  if (!b) return;
+  const act = b.getAttribute('data-act');
+  if (act.startsWith('type:')){ retype(S, act.slice(5)); return paint(viewForm()); }
+  if (act === 'untype'){ return paint(viewType()); }
+  if (act === 'place') return pickPlace();
+  if (act === 'from')  return pickAccount('from', TYPES[S.type].lf);
+  if (act === 'to')    return pickAccount('to', TYPES[S.type].lt);
+  if (act === 'cur')   return pickCurrency();
+  if (act === 'send')  return send();
+  if (act === 'back')  return paint(viewForm());
+});
+
+/* ═══════════════ запуск ═══════════════ */
+
+function boot(){
+  if (TG){ try { TG.ready(); TG.expand(); } catch (e) { /* вне Telegram методов может не быть */ } }
+  if (RAW_HASH === 'test') return runTests();
+
+  const part = fragPart(RAW_HASH);
+  if (!part)
+    return paint(viewError('Каталога нет',
+      'Страница открывается кнопкой «записать трату» в чате бота — она приносит ' +
+      'каталог счетов и мест во фрагменте URL. Без него форме нечего предлагать.'));
+  if (typeof DecompressionStream === 'undefined')
+    return paint(viewError('Браузер без gzip',
+      'Каталог сжат gzip, а DecompressionStream здесь нет. Обнови Telegram или систему.'));
+
+  decodeCatalog(part)
+    .then(cat => {
+      setCatalog(checkCatalog(cat));
+      S = fresh();
+      paint(viewType());
+    })
+    .catch(err => paint(viewError('Каталог не читается', String(err && err.message || err))));
+}
+
+/* ═══════════════ самотесты (#test) ═══════════════ */
+
+// Вектор собран каталогом бота: gzip(mtime=0, level 9), base64url без набивки,
+// длина не кратна 4 — восстановление набивки прогоняется настоящей строкой.
+const VECTOR = 'H4sIAAAAAAACE22RTU_DMAyG_0qVcw7tmtEpt1ENmFRpEh8S0tghTVOINpKRtMCE-O-kSUktxsWN_Pi1X7tf6B3RDCOG6HaLltaKztJLpva0ZKZBGC3RDkdQMvsSc6u3XnYnujkKJdVzUrMDU1xYx1eBfzpihaVXWjdO2gqHHv9B10ZzYaSX_uEPaq_0h4pgrbh-FfTOzTInl7312UqyWh5k51oE75Vmg6by9N4wZVthLN30Xew0ZdcqNNphdPRXKHXbCpHc6N46y_lQ_dSnJGuHmM-HSNLpnc98FD6SxH84wBcBeFnuMcnOdAsgW4AiUoChQZDCUoTT6I8DnIN3ASY0CfARTI0ORjXCJDYspibjwuEENcjPfmWTjwZ0hTvOz24z7jgWuV_w_QPY37zakAIAAA';
+const EXPECTED = {"v":1,"a":[["Assets:Bank:Card","A"],["Assets:Cash","A"],
+  ["Equity:Opening balances","E"],["Expenses:Food:Cafe","X"],["Expenses:Food:Groceries","X"],
+  ["Expenses:Unknown","X"],["Income:Salary","R"],["Liabilities:Bank:Loan","L"],
+  ["Transfers:Out","X"],["Transfers:In","R"]],
+  "p":[["Coffee House",3],["Перевод между своими счетами",0],["Магазин у дома",4],
+  ["Зарплата",0],["Новое место"]]};
+
+async function runTests(){
+  const cases = [];
+  const t = (name, fn) => cases.push([name, fn]);
+  const eq = (got, want, what) => {
+    const g = JSON.stringify(got), w = JSON.stringify(want);
+    if (g !== w) throw new Error(`${what || 'значение'}: ${g} ≠ ${w}`);
+  };
+
+  t('фрагмент: c= находится и до, и после tgWebApp*', () => {
+    eq(fragPart('c=AAA&tgWebAppData=xxx'), 'AAA');
+    eq(fragPart('tgWebAppData=xxx&c=BBB'), 'BBB');
+    eq(fragPart('tgWebAppData=xxx'), null);
+    eq(fragPart(''), null);
+  });
+
+  t('вектор бота декодируется байт в байт (набивка восстановлена)', async () => {
+    eq(VECTOR.length % 4 === 0, false, 'вектор обязан быть без набивки');
+    eq(await decodeCatalog(VECTOR), EXPECTED);
+  });
+
+  t('битый base64 — отказ, а не молчание', async () => {
+    let failed = false;
+    try { await decodeCatalog('%%%%'); } catch (e) { failed = true; }
+    eq(failed, true);
+  });
+
+  t('чужая версия каталога отбивается', () => {
+    let failed = false;
+    try { checkCatalog({v:2, a:[], p:[]}); } catch (e) { failed = true; }
+    eq(failed, true);
+    checkCatalog({v:1, a:[], p:[]});
+  });
+
+  t('фильтры типов: деревья ADR-0004, Equity и Expenses:Unknown вне списков', () => {
+    setCatalog(EXPECTED);
+    eq(allowed(TYPES.spend.from), ['Assets:Bank:Card','Assets:Cash','Liabilities:Bank:Loan']);
+    eq(allowed(TYPES.spend.to), ['Expenses:Food:Cafe','Expenses:Food:Groceries','Transfers:Out']);
+    eq(allowed(TYPES.income.from), ['Income:Salary','Transfers:In']);
+    eq(allowed(TYPES.income.to), ['Assets:Bank:Card','Assets:Cash']);
+    eq(allowed(TYPES.repay.to), ['Liabilities:Bank:Loan']);
+  });
+
+  t('типичный счёт — самый частый дефолт мест; нет следа — пусто', () => {
+    setCatalog(EXPECTED);
+    eq(typical(TYPES.spend.from), 'Assets:Bank:Card');   // 2 места против 0
+    eq(typical(['Liabilities']), null);
+    eq(typical(TYPES.income.from), null);
+  });
+
+  t('guard молчит, пока ввод подходит хоть одному месту', () => {
+    setCatalog(EXPECTED);
+    eq(hitsAny('Coff'), true);
+    eq(hitsAny('магазин у'), true);
+    eq(hitsAny('Гараж 51'), false);
+  });
+
+  t('guard ловит опечатку и транслитерацию, незнакомое отдаёт как новое', () => {
+    setCatalog(EXPECTED);
+    eq(nearestPlace('Coffe Hous'), 'Coffee House');
+    eq(nearestPlace('Magazin u doma'), 'Магазин у дома');
+    eq(nearestPlace('Гараж 51'), null);
+  });
+
+  t('тип подставляет типичный счёт и не трогает выбранное руками', () => {
+    setCatalog(EXPECTED);
+    let s = retype(fresh(), 'spend');
+    eq(s.from, 'Assets:Bank:Card'); eq(s.fromWhy, 'типичное');
+    eq(s.to, null, 'у траты «куда» ждёт места');
+    s.from = 'Assets:Cash'; s.fromWhy = '';
+    retype(s, 'move');
+    eq(s.from, 'Assets:Cash', 'выбранное руками пережило смену типа');
+    eq(s.to, 'Assets:Bank:Card'); eq(s.toWhy, 'типичное');
+  });
+
+  t('перевод сам в себя не подставляется', () => {
+    setCatalog(EXPECTED);
+    const s = retype(fresh(), 'move');
+    eq(s.from === s.to, false);
+  });
+
+  t('место подставляет «куда» по прошлой записи, мимо фильтра — нет', () => {
+    setCatalog(EXPECTED);
+    let s = retype(fresh(), 'spend');
+    applyPlace(s, 'Coffee House');
+    eq(s.to, 'Expenses:Food:Cafe'); eq(s.toWhy, 'по месту');
+    s = retype(fresh(), 'spend');
+    applyPlace(s, 'Зарплата');       // дефолт Assets не лезет в «куда» траты
+    eq(s.to, null);
+    s = retype(fresh(), 'spend');
+    s.to = 'Expenses:Food:Groceries'; s.toWhy = '';
+    applyPlace(s, 'Coffee House');
+    eq(s.to, 'Expenses:Food:Groceries', 'явный выбор не перебит');
+  });
+
+  t('payload: сумма строкой с двумя знаками, note не едет пустым', () => {
+    const s = fresh();
+    Object.assign(s, {amount:'1200', place:'Coffee House',
+                      from:'Assets:Bank:Card', to:'Expenses:Food:Cafe'});
+    const p = buildPayload(s);
+    eq(p.amount, '1200.00');
+    eq('note' in p, false);
+    eq(p.v, 1);
+    s.note = 'обед';
+    eq(buildPayload(s).note, 'обед');
+  });
+
+  t('запрещённые для журнала символы вычищаются', () => {
+    const s = fresh();
+    Object.assign(s, {amount:'5', place:'Star;bucks | обед',
+                      from:'Assets:Bank:Card', to:'Expenses:Food:Cafe', note:'a;b|c'});
+    const p = buildPayload(s);
+    eq(/[;|]/.test(p.payee), false);
+    eq(/[;|]/.test(p.note), false);
+  });
+
+  t('готовность: from=to, нулевая и кривая сумма блокируют отправку', () => {
+    const s = fresh();
+    Object.assign(s, {amount:'10', place:'x', from:'A:1', to:'B:2'});
+    eq(ready(s), true);
+    eq(ready({...s, to:'A:1'}), false);
+    eq(ready({...s, amount:'0'}), false);
+    eq(ready({...s, amount:'1.234'}), false);
+    eq(ready({...s, place:'  '}), false);
+  });
+
+  const out = [];
+  let failed = 0;
+  for (const [name, fn] of cases){
+    try { await fn(); out.push(`<div class="case">✓ ${esc(name)}</div>`); }
+    catch (err){
+      failed++;
+      out.push(`<div class="case fail">✗ ${esc(name)}<br>${esc(err.message)}</div>`);
+    }
+  }
+  const sum = failed
+    ? `<div class="sum bad">ПРОВАЛ: ${failed} из ${cases.length}</div>`
+    : `<div class="sum good">OK: ${cases.length} из ${cases.length}</div>`;
+  document.title = failed ? `tests: ${failed} FAIL` : 'tests: OK';
+  app.innerHTML = `<div class="tests"><h2>Самотесты формы</h2>${out.join('')}${sum}</div>`;
+}
+
+// Наружу — для самотестов и проверки руками из консоли.
+window.FM = {decodeCatalog, checkCatalog, fragPart, fits, allowed, typical, setCatalog,
+             nearestPlace, hitsAny, retype, applyPlace, buildPayload, ready, fresh,
+             journalPreview};
+
+boot();
+</script>
+</body>
+</html>
