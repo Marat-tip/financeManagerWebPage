@@ -19,9 +19,22 @@
   фрагменту: клиент Telegram дописывает свои `tgWebApp*` через `&`.
 
   Каталог (версия 1):
-      {"v":1, "a":[["Assets:Cash","A"],...], "p":[["Starbucks",5],["Без дефолта"]]}
+      {"v":1, "a":[["Assets:Cash","A"],["Assets:Binance:Spot","A","USDT"],...],
+       "c":{"KZT":2,"USDT":8,...}, "p":[["Starbucks",5],["Без дефолта"]]}
   `a` — счета в порядке объявления, `[имя, тип]`. `p` — места по убыванию частоты,
   `[payee, индекс счёта-получателя прошлой записи в a]`; один элемент = дефолта нет.
+
+  Валюты приезжают двумя необязательными полями (расширение аддитивное, версия от него
+  не поднялась — бот fm-kmd.37.6):
+  `c` — объявленные `commodity` журнала и знаки после точки у каждой. Отсюда, а не из
+  зашитой двойки, берётся предел поля ввода суммы: `0.23928074 USDT`, срезанное здесь
+  до `0.24`, приедет к боту правдоподобным, и его гейт такую потерю уже не поймает.
+  Третий элемент счёта — валюта, заданная САМИМ счётом (`Assets:Binance:*` → `USDT`);
+  форма подставляет её и поля выбора валюты не показывает, лишний тап стоял бы на
+  каждой покупке кофе. Правило живёт в боте (`journal.currency_of()`), сюда приезжает
+  каталогом — второй копии списка префиксов в статике нет.
+  Каталога без этих полей (бот старее fm-kmd.37.6) страница не пугается: валюты берутся
+  из запасного списка, точность у всех прежняя — два знака.
 
   Ответ боту — Telegram.WebApp.sendData, поля JSON = поля транзакции (схема 1):
       {"v":1,"date":"2026-08-12","payee":"Starbucks","from":"Assets:Bank:Card",
@@ -91,10 +104,22 @@
     outline:none;text-align:center;letter-spacing:-.02em;
   }
   input.amt::placeholder{color:var(--hint);opacity:.5}
+  /* Длинная сумма (восемь знаков после точки) на 36px не влезает в ширину телефона:
+     36px даёт ~20px на цифру, а поля ввода на экране 320px — 268px. Ужимается шрифт,
+     а не обрезается значение. */
+  input.amt.sm{font-size:28px}
+  input.amt.xs{font-size:22px}
   .curbtn{
     font:inherit;font-size:14px;color:var(--link);background:none;border:0;cursor:pointer;
-    padding:2px 8px;margin-top:2px;
+    padding:2px 8px;margin-top:2px;display:inline-block;
   }
+  /* Валюта, заданную счётом, выбрать нельзя — но видна она в том же слоте и с теми же
+     размерами, что и кнопка выбора: подпись под суммой не прыгает от смены счёта.
+     `display:inline-block` у `.curbtn` для этого и стоит — у голого span margin-top
+     не работает вовсе. */
+  .curbtn.fix{color:var(--hint);cursor:default}
+  .amthint{font-size:12px;line-height:1.4;margin-top:8px;color:#a8730b}
+  @media (prefers-color-scheme: dark){.amthint{color:#e8b23c}}
   input.txt{font:inherit;border:0;background:transparent;color:inherit;width:100%;outline:none;padding:0}
   input.date{
     font:inherit;border:0;background:transparent;color:inherit;outline:none;padding:0;
@@ -215,7 +240,10 @@ const EXCLUDED = new Set(['Expenses:Unknown']);
 // Что запрещено в свободном тексте зеркально боту: `;` открывает комментарий hledger,
 // `|` режет payee от заметки, управляющие символы ломают строку журнала.
 const FORBIDDEN = /[;|\u0000-\u001f\u007f]/g;
-const AMOUNT_RE = /^\d+(\.\d{1,2})?$/;
+// Форма суммы — только форма, зеркально боту (`journal.AMOUNT`): цифры, точка, дробная
+// часть, без знака. СКОЛЬКО знаков допустимо, здесь не сказано ни числом, ни в
+// квантификаторе: это свойство валюты, и берётся оно из `c` каталога (см. placesOf).
+const AMOUNT_RE = /^(\d+)(?:\.(\d+))?$/;
 
 /* Тип операции — фильтр деревьев «откуда → куда» и подписи полей (ADR-0004).
    В журнал тип не попадает: он израсходован на фильтрацию. Дерево счёта читается из
@@ -237,13 +265,23 @@ const TYPES = {
            lf:'С какого', lt:'По какому', toTypical:true},
 };
 
+// Запасной список валют и запасная точность: каталог без `c` приезжает от бота старее
+// fm-kmd.37.6. С `c` не сверяется намеренно — это не второй список, а поведение до
+// того, как список вообще появился.
 const CURRENCIES = ['KZT', 'USD', 'EUR', 'TRY', 'RUB'];
+const PLACES_FALLBACK = 2;
 
 /* ═══════════════ каталог ═══════════════ */
 
 let CAT = null;
+let FIXED = new Map();      // счёт → валюта, заданная самим счётом (третий элемент a[i])
 
-function setCatalog(cat){ CAT = cat; }
+function setCatalog(cat){
+  CAT = cat;
+  // Третий элемент есть только у счетов, чью валюту задаёт сам счёт; у остальных его
+  // нет вовсе — карта поэтому короткая, а `fixedCur` на всех прочих отвечает пустотой.
+  FIXED = new Map((cat && cat.a || []).filter(a => a.length > 2).map(a => [a[0], a[2]]));
+}
 
 function fragPart(hash){
   for (const piece of hash.split('&')) if (piece.startsWith('c=')) return piece.slice(2);
@@ -265,6 +303,10 @@ function checkCatalog(cat){
     throw new Error(`каталог версии ${cat.v}, страница понимает ${CATALOG_VERSION} — ` +
                     `страница в кеше вебвью разъехалась с ботом; закрой форму и открой заново`);
   if (!Array.isArray(cat.a) || !Array.isArray(cat.p)) throw new Error('в каталоге нет a/p');
+  // `c` необязательно (каталог бота старее fm-kmd.37.6), но если приехало — обязано
+  // быть объектом: массив здесь дал бы список валют из индексов, молча и правдоподобно.
+  if (cat.c !== undefined && (typeof cat.c !== 'object' || cat.c === null || Array.isArray(cat.c)))
+    throw new Error('поле c каталога не объект «валюта → знаков после точки»');
   return cat;
 }
 
@@ -304,6 +346,68 @@ function placeTarget(payee){
   const place = CAT.p.find(p => p[0] === payee);
   if (!place || place.length < 2) return null;
   return (CAT.a[place[1]] || [])[0] || null;
+}
+
+/* ═══════════════ валюты ═══════════════ */
+
+/* Валюта у формы приезжает каталогом, а не живёт в коде: список валют закрыт
+   `commodity`-директивами журнала, точность каждой объявлена там же (ADR-0012), и
+   вторая копия того и другого в статике разошлась бы с планом на первой же монете. */
+
+const currencies = () => (CAT && CAT.c) ? Object.keys(CAT.c) : CURRENCIES;
+
+// Знаков после точки у валюты. Здесь стоит единственное место, где форма решает, что
+// делать с хвостом суммы, — и решает по журналу, а не по привычке к двум знакам.
+const placesOf = cur =>
+  (CAT && CAT.c && Number.isInteger(CAT.c[cur])) ? CAT.c[cur] : PLACES_FALLBACK;
+
+const fixedCur = name => FIXED.get(name) || '';
+
+/* Валюта записи: заданная счётом сильнее выбранной руками, поэтому выбор и не
+   показывается. Если её задают ОБА счёта и по-разному, записи не существует вовсе:
+   бот сверяет `cur` с каждым из счетов (`journal.validate()`), и любой выбор будет
+   отбит — такой обмен по ADR-0012 пишется руками, а не формой. */
+function curPick(s){
+  const from = fixedCur(s.from), to = fixedCur(s.to);
+  return {cur: from || to || s.cur, fixed: !!(from || to),
+          clash: (from && to && from !== to) ? to : ''};
+}
+
+const curOf = s => curPick(s).cur;
+
+// Знаков после точки в набранном. Дробная часть длиннее объявленной — это не «почти
+// то же число»: у ETH восьмой знак стоит сотен тенге (ADR-0012).
+const fracLen = raw => (AMOUNT_RE.exec(String(raw)) || [])[2]?.length || 0;
+
+const amountOk = (raw, places) => {
+  const m = AMOUNT_RE.exec(String(raw));
+  return !!m && (m[2] || '').length <= places && +raw > 0;
+};
+
+/* Ввод суммы: цифры, одна точка, дробная часть не длиннее объявленной для валюты.
+   Обрезка идёт на глазах у владельца, во время набора — молча срезать уже набранное
+   форма права не имеет, для этого есть подсказка под суммой.
+
+   Запятая переводится в точку, а не выбрасывается: `inputmode="decimal"` на русской
+   раскладке телефона печатает разделителем именно её, а выброшенная запятая делает из
+   `1,50` число `150` — в сто раз больше, и правдоподобно. */
+function clampAmount(raw, places){
+  const v = String(raw).replace(/,/g, '.').replace(/[^\d.]/g, '');
+  const dot = v.indexOf('.');
+  if (dot === -1) return v;
+  if (places <= 0) return v.slice(0, dot);
+  return v.slice(0, dot + 1) + v.slice(dot + 1).replace(/\./g, '').slice(0, places);
+}
+
+/* Сумма для отправки — строкой и без арифметики: `(+v).toFixed(8)` на больших числах
+   врёт последним знаком, а бот ждёт ровно те цифры, что видел владелец. Дробная часть
+   добивается нулями до объявленной точности. */
+function fmtAmount(raw, places){
+  const m = AMOUNT_RE.exec(String(raw));
+  if (!m) return String(raw);
+  const head = m[1].replace(/^0+(?=\d)/, '');
+  if (places <= 0) return head;         // валюта без дробной части — бот скажет своё
+  return head + '.' + ((m[2] || '') + '0'.repeat(places)).slice(0, places);
 }
 
 /* ═══════════════ fuzzy-guard на новое место ═══════════════ */
@@ -356,6 +460,10 @@ const today = () => {
 
 let S = null;
 
+/* `cur` — валюта, ВЫБРАННАЯ руками (или дефолт). Та, что поедет боту, считается
+   `curPick()`: у счёта со своей валютой она перебивает выбор. Хранить одно поле на
+   оба смысла нельзя — выбор владельца пережил бы возврат с крипто-счёта на тенговый
+   только случайно. */
 function fresh(){
   return {type:null, amount:'', cur:'KZT', place:'', from:null, to:null,
           fromWhy:'', toWhy:'', date:today(), note:''};
@@ -397,14 +505,16 @@ function applyPlace(s, payee){
 const clean = text => String(text ?? '').replace(FORBIDDEN, ' ');
 
 function ready(s){
-  return AMOUNT_RE.test(s.amount) && +s.amount > 0
+  const pick = curPick(s);
+  return !pick.clash && amountOk(s.amount, placesOf(pick.cur))
     && !!clean(s.place).trim() && !!s.from && !!s.to && s.from !== s.to
     && /^\d{4}-\d{2}-\d{2}$/.test(s.date);
 }
 
 function buildPayload(s){
+  const cur = curOf(s);
   const p = {v:SCHEMA_VERSION, date:s.date, payee:clean(s.place).trim(),
-             from:s.from, to:s.to, amount:(+s.amount).toFixed(2), cur:s.cur};
+             from:s.from, to:s.to, amount:fmtAmount(s.amount, placesOf(cur)), cur};
   const note = clean(s.note).trim();
   if (note) p.note = note;            // необязательное поле не едет пустым
   return p;
@@ -467,14 +577,47 @@ function viewType(){
       берутся счета, и подставляет типичный. В журнал уходят два счёта.</div>`;
 }
 
+// Класс поля суммы: чем длиннее набранное, тем мельче шрифт. Считается по длине
+// строки, а не по валюте: восемь знаков бывают и у короткого числа, и у длинного.
+const amtClass = v => v.length > 13 ? 'amt xs' : v.length > 9 ? 'amt sm' : 'amt';
+
+/* Подсказка под суммой. Появляется только тогда, когда отправку что-то держит и
+   владелец без объяснения увидел бы просто серую кнопку. Место выбрано у суммы, а не
+   у кнопки: чинить надо здесь. Сдвиг остального вниз безвреден — в обоих случаях
+   «Отправить» выключена, и промах пальцем ничего не делает. */
+function amtHint(){
+  const pick = curPick(S);
+  if (pick.clash)
+    return `<div class="amthint">${esc(short(S.from))} ведётся в ${esc(pick.cur)},
+      ${esc(short(S.to))} — в ${esc(pick.clash)}. Обмен пишется руками: у записи одна
+      валюта, и бот отобьёт любую из двух.</div>`;
+  const places = placesOf(pick.cur);
+  if (fracLen(S.amount) > places)
+    return `<div class="amthint">У ${esc(pick.cur)} знаков после точки ${places}, а в
+      сумме ${fracLen(S.amount)}. Лишнее не срезается само — поправь руками, чтобы не
+      потерять хвост молча.</div>`;
+  return '';
+}
+
+/* Валюта в том же слоте, что и кнопка выбора: заданную счётом видно, но выбрать её
+   нельзя — поле выбора стоило бы тапа на каждой покупке кофе (fm-kmd.37). Метрики у
+   span и button одинаковые, поэтому смена счёта вёрстку не двигает. */
+function curSlot(){
+  const pick = curPick(S);
+  return pick.fixed
+    ? `<span class="curbtn fix">${esc(pick.cur)}</span>`
+    : `<button type="button" class="curbtn" data-act="cur">${esc(pick.cur)}</button>`;
+}
+
 function viewForm(){
   const t = TYPES[S.type];
   return `<div class="typebar"><span>${t.ic}</span><b>${esc(t.t)}</b>
       <button type="button" data-act="untype">сменить</button></div>
     <div class="group"><div class="amtwrap">
-      <input class="amt" id="amount" inputmode="decimal" placeholder="0"
+      <input class="${amtClass(S.amount)}" id="amount" inputmode="decimal" placeholder="0"
              value="${esc(S.amount)}" autocomplete="off">
-      <button type="button" class="curbtn" data-act="cur">${esc(S.cur)}</button>
+      ${curSlot()}
+      <div id="amtnote">${amtHint()}</div>
     </div></div>
     <div class="group">
       ${rowPick('Место', S.place, 'выбрать', 'place')}
@@ -617,12 +760,21 @@ function pickPlace(){
   });
 }
 
+const DEADEND_CURRENCY = `<div class="deadend">Другой валюты нет?
+  <b>Список закрытый.</b> Валюта — <code>commodity</code>-директива журнала: на
+  необъявленной падает разбор (<code>--strict</code>), поэтому бот такую запись
+  отобьёт. Лечение — объявить монету на ноуте. Знаков после точки у каждой сказано
+  там же, и поле суммы считает по ним.</div>`;
+
 function pickCurrency(){
+  const listed = currencies();          // из каталога, а не из кода — см. `currencies`
   openSheet({
     title:'Валюта', search:false,
     paint(){
-      let html = CURRENCIES.map(c => optHtml(c, c, '')).join('');
-      html += `<div class="deadend">Другая — тремя буквами:
+      let html = listed.map(c => optHtml(c, c, `знаков после точки: ${placesOf(c)}`)).join('');
+      // Ввод валюты руками остаётся только у каталога без `c`: там закрытого списка
+      // формой не видно, и запретить незнакомый код значило бы решить за журнал.
+      html += (CAT && CAT.c) ? DEADEND_CURRENCY : `<div class="deadend">Другая — тремя буквами:
         <input id="curFree" maxlength="3" style="font:inherit;width:5em;margin-left:6px;
           text-transform:uppercase;border:1px solid var(--sep);border-radius:6px;
           padding:4px 8px;background:var(--bg);color:inherit;outline:none"></div>`;
@@ -643,12 +795,16 @@ function pickCurrency(){
 function wire(){
   const amount = document.getElementById('amount');
   if (amount) amount.oninput = e => {
-    // Только цифры, одна точка, не больше двух знаков после — как примет бот.
-    let v = e.target.value.replace(/[^\d.]/g, '');
-    const dot = v.indexOf('.');
-    if (dot !== -1) v = v.slice(0, dot + 1) + v.slice(dot + 1).replace(/\./g, '').slice(0, 2);
+    // Только цифры, одна точка, знаков после — сколько объявлено у ВАЛЮТЫ ЗАПИСИ:
+    // у тенге два, у USDT восемь. Зашитая двойка здесь резала бы крипту молча.
+    const v = clampAmount(e.target.value, placesOf(curOf(S)));
     e.target.value = v;
+    e.target.className = amtClass(v);
     S.amount = v;
+    // Подсказка про знаки обновляется здесь же: перерисовать всю форму значило бы
+    // потерять фокус и клавиатуру посреди набора.
+    const hint = document.getElementById('amtnote');
+    if (hint) hint.innerHTML = amtHint();
     const cta = app.querySelector('[data-act="send"]');
     if (cta) cta.disabled = !ready(S);
   };
@@ -711,6 +867,15 @@ const EXPECTED = {"v":1,"a":[["Assets:Bank:Card","A"],["Assets:Cash","A"],
   ["Transfers:Out","X"],["Transfers:In","R"]],
   "p":[["Coffee House",3],["Перевод между своими счетами",0],["Магазин у дома",4],
   ["Зарплата",0],["Новое место"]]};
+
+// Второй вектор — каталог с валютами (fm-kmd.37.6), собран тем же `catalog.encode()`:
+// счета с третьим элементом, поле `c` со всеми семью объявленными валютами.
+const VECTOR_CUR = 'H4sIAAAAAAACE2VQyU7DMBD9lWrOPjRxgMi3UrpIDZcsElByMMlEWER2hNNSqeq_40xKGtrLe6O3eEY-wh6Ex0CC2G5hZi22Vsyl_QQGM8jZoG2kbZRYmbq8dh6VlrpAkTSmJY9BljylFFkcGtQWrVgaU7p3K3Tuy38rwe-9KtDeOpn-0uZHD0ak5IeqVavwsnVZ4yEysgtFw-acQQHiCJu3FIRPKnEavxIvsvhPd4HQCemaeBXPnt1wYtDQh8xNVSFO1mZn3eW8O-J9Nw28okN-12EwJXwghWZekuIDC4ZCdV3oZ-4TImEwIRq9ze97g2qc7MC76YWjWjgKnW_ql_qj-85RYF6en34BL6ppDAICAAA';
+const EXPECTED_CUR = {"v":1,"a":[["Assets:Cash","A"],["Assets:Kaspi:Gold","A"],
+  ["Assets:Binance:Spot","A","USDT"],["Expenses:Food:Cafe","X"],["Expenses:Services","X"],
+  ["Expenses:Unknown","X"],["Liabilities:Binance:FlexLoan","L","USDT"]],
+  "c":{"KZT":2,"USD":2,"TRY":2,"EUR":2,"USDT":8,"ETH":8,"GRAM":8},
+  "p":[["Coffee House",3],["Мерчант",4],["Перевод между своими счетами",1]]};
 
 async function runTests(){
   const cases = [];
@@ -806,7 +971,146 @@ async function runTests(){
     eq(s.to, 'Expenses:Food:Groceries', 'явный выбор не перебит');
   });
 
+  t('каталог с валютами декодируется вектором бота', async () => {
+    eq(VECTOR_CUR.length % 4 === 0, false, 'вектор обязан быть без набивки');
+    eq(await decodeCatalog(VECTOR_CUR), EXPECTED_CUR);
+    checkCatalog(EXPECTED_CUR);
+  });
+
+  t('каталог с `c` вместо массива отбивается', () => {
+    let failed = false;
+    try { checkCatalog({v:1, a:[], p:[], c:[2, 8]}); } catch (e) { failed = true; }
+    eq(failed, true);
+    checkCatalog({v:1, a:[], p:[]});          // без `c` — прежний каталог, законный
+  });
+
+  t('точность и список валют берутся из каталога, без него — прежние два знака', () => {
+    setCatalog(EXPECTED_CUR);
+    eq(placesOf('KZT'), 2);
+    eq(placesOf('USDT'), 8);
+    eq(placesOf('ETH'), 8);
+    eq(placesOf('BTC'), 2, 'необъявленной валюты в каталоге нет — запасная точность');
+    eq(currencies(), ['KZT','USD','TRY','EUR','USDT','ETH','GRAM']);
+    setCatalog(EXPECTED);                     // каталог старого бота: `c` нет вовсе
+    eq(placesOf('KZT'), 2);
+    eq(placesOf('USDT'), 2);
+    eq(currencies(), CURRENCIES);
+  });
+
+  t('валюта счёта подставляется и выбор валюты не показывается', () => {
+    setCatalog(EXPECTED_CUR);
+    eq(fixedCur('Assets:Binance:Spot'), 'USDT');
+    eq(fixedCur('Assets:Kaspi:Gold'), '', 'у фиатного счёта третьего элемента нет');
+    const s = fresh();
+    Object.assign(s, {from:'Assets:Binance:Spot', to:'Expenses:Services'});
+    eq(curPick(s), {cur:'USDT', fixed:true, clash:''});
+    S = s;
+    eq(curSlot().includes('data-act="cur"'), false, 'кнопки выбора валюты нет');
+    eq(curSlot().includes('USDT'), true, 'но сама валюта видна');
+    // Валюта задана и «куда»: погашение крипто-займа приходит с той же стороны.
+    const r = fresh();
+    Object.assign(r, {from:'Assets:Binance:Spot', to:'Liabilities:Binance:FlexLoan'});
+    eq(curOf(r), 'USDT');
+  });
+
+  t('фиатный счёт: валюта выбирается руками, выбор пережил заход на крипто-счёт', () => {
+    setCatalog(EXPECTED_CUR);
+    const s = fresh();
+    Object.assign(s, {from:'Assets:Kaspi:Gold', to:'Expenses:Food:Cafe', cur:'EUR'});
+    eq(curPick(s), {cur:'EUR', fixed:false, clash:''});
+    s.from = 'Assets:Binance:Spot';
+    eq(curOf(s), 'USDT', 'счёт сильнее выбора');
+    s.from = 'Assets:Kaspi:Gold';
+    eq(curOf(s), 'EUR', 'выбор руками вернулся, а не сбросился в тенге');
+  });
+
+  t('два счёта с разными своими валютами — отправка заблокирована', () => {
+    setCatalog({...EXPECTED_CUR, a:[...EXPECTED_CUR.a, ['Assets:Binance:Eth','A','ETH']]});
+    const s = fresh();
+    Object.assign(s, {amount:'1.0', place:'x', date:today(),
+                      from:'Assets:Binance:Spot', to:'Assets:Binance:Eth'});
+    eq(curPick(s).clash, 'ETH');
+    eq(ready(s), false, 'бот отобьёт любую из двух — обмен пишется руками');
+  });
+
+  t('ввод суммы режется по валюте: тенге два знака, USDT восемь', () => {
+    setCatalog(EXPECTED_CUR);
+    eq(clampAmount('1200.9999', 2), '1200.99');
+    eq(clampAmount('0.23928074', 8), '0.23928074');
+    eq(clampAmount('0.239280741', 8), '0.23928074');
+    eq(clampAmount('1 200,50', 2), '1200.50', 'запятая — тоже разделитель, а не мусор');
+    eq(clampAmount('1.2.3', 2), '1.23', 'вторая точка не открывает новую дробную часть');
+  });
+
+  t('восемь знаков доезжают до payload неокруглёнными', () => {
+    setCatalog(EXPECTED_CUR);
+    const s = fresh();
+    Object.assign(s, {amount:'0.23928074', place:'Мерчант',
+                      from:'Assets:Binance:Spot', to:'Expenses:Services'});
+    eq(ready(s), true);
+    const p = buildPayload(s);
+    eq(p.amount, '0.23928074');
+    eq(p.cur, 'USDT');
+    // Ровно те проверки, которыми встретит бот (`journal.validate`): форма не имеет
+    // права присылать то, что уедет в карантин.
+    eq(/^\d+\.\d+$/.test(p.amount), true);
+    eq(p.amount.split('.')[1].length <= placesOf(p.cur), true);
+    eq(EXPECTED_CUR.c[p.cur] !== undefined, true, 'валюта объявлена commodity');
+  });
+
+  t('сумма форматируется строкой, без арифметики с плавающей точкой', () => {
+    eq(fmtAmount('1200', 2), '1200.00');
+    eq(fmtAmount('1200.5', 2), '1200.50');
+    eq(fmtAmount('0.5', 8), '0.50000000');
+    eq(fmtAmount('012.5', 2), '12.50', 'ведущие нули срезаны');
+    eq(fmtAmount('0.1', 2), '0.10', 'единственный ноль целой части остался');
+    eq(fmtAmount('12345678.12345678', 8), '12345678.12345678');
+    // Строке безразлична величина числа. `(+v).toFixed(8)` на суммах, какие бывают,
+    // не теряет ничего, но у него есть граница, за которой он молча округляет — и
+    // помнить, где она, не нужно никому (замер node 26).
+    eq(fmtAmount('1234567890.12345678', 8), '1234567890.12345678');
+    eq((+'1234567890.12345678').toFixed(8), '1234567890.12345672');
+  });
+
+  t('сумма с лишними знаками не отправляется и не режется молча', () => {
+    setCatalog(EXPECTED_CUR);
+    const s = fresh();
+    Object.assign(s, {amount:'0.23928074', place:'Мерчант',
+                      from:'Assets:Binance:Spot', to:'Expenses:Services'});
+    eq(ready(s), true);
+    s.from = 'Assets:Kaspi:Gold';              // тот же ввод, но валюта стала тенговой
+    eq(curOf(s), 'KZT');
+    eq(fracLen(s.amount), 8);
+    eq(ready(s), false, 'восемь знаков в тенге — отправка держится');
+    eq(s.amount, '0.23928074', 'форма ничего не срезала сама');
+    S = s;
+    eq(amtHint().includes('знаков после точки 2'), true, 'и сказала, почему');
+    s.amount = '0.24';
+    eq(ready(s), true);
+  });
+
+  t('старый каталог: тенге, два знака, выбор валюты на месте', () => {
+    setCatalog(EXPECTED);                      // ни `c`, ни третьих элементов
+    const s = fresh();
+    Object.assign(s, {amount:'1200', place:'Coffee House',
+                      from:'Assets:Bank:Card', to:'Expenses:Food:Cafe'});
+    eq(curPick(s), {cur:'KZT', fixed:false, clash:''});
+    eq(placesOf('KZT'), 2);
+    eq(clampAmount('12.345', placesOf(curOf(s))), '12.34');
+    eq(buildPayload(s).amount, '1200.00');
+    S = s;
+    eq(curSlot().includes('data-act="cur"'), true, 'кнопка выбора валюты на месте');
+    eq(amtHint(), '');
+  });
+
+  t('поле суммы мельчает на длинном числе, а не уезжает за край', () => {
+    eq(amtClass('1200'), 'amt');
+    eq(amtClass('0.23928074'), 'amt sm');
+    eq(amtClass('12345678.12345678'), 'amt xs');
+  });
+
   t('payload: сумма строкой с двумя знаками, note не едет пустым', () => {
+    setCatalog(EXPECTED);
     const s = fresh();
     Object.assign(s, {amount:'1200', place:'Coffee House',
                       from:'Assets:Bank:Card', to:'Expenses:Food:Cafe'});
@@ -853,10 +1157,12 @@ async function runTests(){
   app.innerHTML = `<div class="tests"><h2>Самотесты формы</h2>${out.join('')}${sum}</div>`;
 }
 
-// Наружу — для самотестов и проверки руками из консоли.
+// Наружу — для самотестов и проверки руками из консоли. `runTests` тоже: браузера под
+// рукой бывает нет, а страница целиком грузится в node с подставным DOM.
 window.FM = {decodeCatalog, checkCatalog, fragPart, fits, allowed, typical, setCatalog,
              nearestPlace, hitsAny, retype, applyPlace, buildPayload, ready, fresh,
-             journalPreview};
+             journalPreview, currencies, placesOf, fixedCur, curPick, curOf, amountOk,
+             fracLen, clampAmount, fmtAmount, amtClass, runTests};
 
 boot();
 </script>
