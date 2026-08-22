@@ -11,7 +11,7 @@
 
   Данных на странице нет. Каталог (счета и места) приезжает фрагментом URL от бота:
 
-      #c=<base64url(gzip(json))>&tgWebAppData=...
+      #c=<base64url(gzip(json))>&tgWebAppVersion=...&tgWebAppPlatform=...
 
   Фрагмент серверу не отправляется, поэтому ни в логах Pages, ни в кеше CDN каталог
   не появляется. Набивка `=` у base64url срезана отправителем — перед декодированием
@@ -533,20 +533,39 @@ function journalPreview(p){
 
 const TG = window.Telegram && window.Telegram.WebApp;
 
-// Настоящий клиент дописывает во фрагмент свои tgWebApp* (замер fm-kmd.15); их
-// отсутствие значит, что страница открыта браузером — sendData уйдёт в никуда,
-// и честнее показать, что ушло бы боту.
 const RAW_HASH = location.hash.slice(1);
-const IN_TELEGRAM = RAW_HASH.includes('tgWebAppData=');
+
+/** Ключи `tgWebApp*`, которые клиент дописал во фрагмент. Только диагностика. */
+function tgKeys(hash){
+  return hash.split('&').map(p => p.split('=')[0]).filter(k => k.startsWith('tgWebApp'));
+}
+const TG_KEYS = tgKeys(RAW_HASH);
+
+// Отправка НЕ спрашивает фрагмент о том, «в Telegram ли мы». Прежняя проверка стояла на
+// `tgWebAppData=` и отбивала ровно тот случай, ради которого страница написана: Mini App,
+// открытый кнопкой реплай-клавиатуры, — единственная точка входа, где `sendData` вообще
+// работает, — приходит БЕЗ `tgWebAppData` (замер 2026-08-22, Android и Desktop: `c=` на
+// месте, клавиатура только что прислана ботом, `tgWebAppData` нет). Спрашиваем сам SDK, а
+// подтверждением успеха считаем то, чем его подтверждает Telegram, — закрытие окна.
+const SEND_TIMEOUT = 1200;
 
 function send(){
   const payload = buildPayload(S);
   const body = JSON.stringify(payload);
-  if (IN_TELEGRAM && TG){
-    TG.sendData(body);                // Telegram сам закрывает Mini App
-    return;
+  if (!TG || typeof TG.sendData !== 'function')
+    return paint(viewDebug(payload, body,
+      'Telegram.WebApp.sendData недоступен — страница открыта браузером'));
+  try {
+    TG.sendData(body);                // прошло — Telegram сам закрывает Mini App
+  } catch (e) {
+    return paint(viewDebug(payload, body, 'sendData отказал: ' + (e && e.message || e)));
   }
-  paint(viewDebug(payload, body));
+  // Живы через SEND_TIMEOUT — значит sendData промолчал: так Telegram отвечает на вызов из
+  // точки входа, где он запрещён (меню бота, ссылка, перезагруженная страница). Трату
+  // показываем, а не теряем.
+  setTimeout(() => paint(viewDebug(payload, body,
+    'sendData не закрыл окно за ' + SEND_TIMEOUT + ' мс — форма открыта не кнопкой ' +
+    '«записать трату»')), SEND_TIMEOUT);
 }
 
 /* ═══════════════ рендер ═══════════════ */
@@ -635,14 +654,16 @@ function viewForm(){
       Не то — тапни и выбери руками.</div>`;
 }
 
-function viewDebug(payload, body){
+function viewDebug(payload, body, why){
   const bytes = new TextEncoder().encode(body).length;
   return `<div class="debug">
-    <h2>Страница открыта вне Telegram</h2>
-    <p class="hint">sendData некому принять — вот что ушло бы боту (${bytes} байт из 4096)
-      и как это легло бы в журнал:</p>
+    <h2>Трата не ушла боту</h2>
+    <p class="hint">${esc(why || 'sendData некому принять')} — вот что ушло бы боту
+      (${bytes} байт из 4096) и как это легло бы в журнал:</p>
     <pre>${esc(JSON.stringify(payload, null, 1))}</pre>
     <pre>${esc(journalPreview(payload))}</pre>
+    <p class="hint">Фрагмент: ${esc(TG_KEYS.length ? TG_KEYS.join(', ') : 'ни одного tgWebApp*')};
+      Telegram.WebApp ${TG ? 'есть' : 'нет'}; initData ${TG && TG.initData ? 'непуст' : 'пуст'}.</p>
     <button type="button" class="cta" data-act="back">Назад к форме</button>
   </div>`;
 }
@@ -890,6 +911,13 @@ async function runTests(){
     eq(fragPart('tgWebAppData=xxx&c=BBB'), 'BBB');
     eq(fragPart('tgWebAppData=xxx'), null);
     eq(fragPart(''), null);
+  });
+
+  t('tgKeys: диагностика видит ключи клиента и не путает их с каталогом', () => {
+    eq(tgKeys('c=AAA&tgWebAppVersion=7.0&tgWebAppPlatform=android'),
+       ['tgWebAppVersion', 'tgWebAppPlatform']);
+    eq(tgKeys('c=AAA'), []);          // запуск кнопкой клавиатуры выглядит именно так
+    eq(tgKeys(''), []);
   });
 
   t('вектор бота декодируется байт в байт (набивка восстановлена)', async () => {
